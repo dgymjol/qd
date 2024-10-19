@@ -49,7 +49,7 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
 
     if opt.eval_split_name in ["val"]:  # since test_public has no GT
         metrics = eval_submission(
-            submission, gt_data,
+            submission, gt_data, opt,
             verbose=opt.debug, match_number=not opt.debug
         )
         save_metrics_path = submission_path.replace(".jsonl", "_metrics.json")
@@ -71,7 +71,7 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
         save_jsonl(submission_after_nms, submission_nms_path)
         if opt.eval_split_name == "val":
             metrics_nms = eval_submission(
-                submission_after_nms, gt_data,
+                submission_after_nms, gt_data, opt,
                 verbose=opt.debug, match_number=not opt.debug
             )
             save_metrics_nms_path = submission_nms_path.replace(".jsonl", "_metrics.json")
@@ -240,11 +240,18 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
         for k, v in loss_meters.items():
             tb_writer.add_scalar("Eval/{}".format(k), v.avg, epoch_i + 1)
 
-    post_processor = PostProcessorDETR(
-        clip_length=2, min_ts_val=0, max_ts_val=150,
-        min_w_l=2, max_w_l=150, move_window_method="left",
-        process_func_names=("clip_ts", "round_multiple")
-    )
+    if opt.dset_name == 'ytc':
+        post_processor = PostProcessorDETR(
+            clip_length=opt.clip_length, min_ts_val=0, max_ts_val=15000000,
+            min_w_l=2, max_w_l=5000, move_window_method="left",
+            process_func_names=("clip_ts", "round_multiple")
+        )
+    else:
+        post_processor = PostProcessorDETR(
+            clip_length=2, min_ts_val=0, max_ts_val=150,
+            min_w_l=2, max_w_l=150, move_window_method="left",
+            process_func_names=("clip_ts", "round_multiple")
+        )
     mr_res = post_processor(mr_res)
     return mr_res, loss_meters
 

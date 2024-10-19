@@ -8,6 +8,7 @@ from os.path import join, exists
 from utils.basic_utils import load_jsonl, l2_normalize_np_array
 from utils.tensor_utils import pad_sequences_1d
 from qd_detr.span_utils import span_xx_to_cxw
+import pickle as pkl
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +106,48 @@ class StartEndDataset(Dataset):
                 model_inputs["video_feat"] = tef
 
         if self.load_labels:
-            if self.dset_name == 'tvsum': 
-                model_inputs["span_labels"] = torch.tensor([[0., 0.]])
-                meta_label = meta['label']
+            if self.dset_name == 'ytc': 
+                
+                s, e = meta["relevant_windows"][0]
+                if e < s:
+                    meta["relevant_windows"] = [[e, s]]
+                    
+                mask = torch.zeros_like(torch.ones(ctx_l))
+
+                s = 0 if meta["relevant_windows"][0][0] == 0 else int(meta["relevant_windows"][0][0] // self.clip_len)
+                e = 0 if meta["relevant_windows"][0][1] == 0 else int(meta["relevant_windows"][0][1] // self.clip_len)
+
+                if e >= len(mask):
+                    print(meta["relevant_windows"], meta["qid"], len(mask))
+                    assert False
+                
+                mask[s:e] = 1
+                model_inputs["pos_mask"] = mask 
+
+                model_inputs["span_labels"] = self.get_span_labels(meta["relevant_windows"], ctx_l)  # (#windows, 2)
                 model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                            self.get_saliency_labels_all_tvsum(meta_label, ctx_l)
+                        self.get_saliency_labels_sub_as_query_(meta["relevant_windows"][0], ctx_l, 2)  # only one gt
+
+                if meta['qid'] == 'youtube_9tMM-xK1cNM_6':
+                    print(model_inputs["saliency_pos_labels"])
+                    print(model_inputs["saliency_neg_labels"])
+                    
             else:
+
+                pos_idx = torch.tensor(meta['relevant_clip_ids'])
+                mask = torch.zeros_like(torch.ones(ctx_l))
+
+                if pos_idx.max() >= len(mask):
+                    new_mask = torch.zeros_like(torch.ones(pos_idx.max()+1 ))
+                    new_mask[pos_idx] = 1
+                    new_mask[:len(mask)] = mask
+                    mask = new_mask
+                else:
+                    mask[pos_idx] = 1
+
+                model_inputs["pos_mask"] = mask 
+
+
                 model_inputs["span_labels"] = self.get_span_labels(meta["relevant_windows"], ctx_l)  # (#windows, 2)
                 if "subs_train" not in self.data_path:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
@@ -118,7 +155,7 @@ class StartEndDataset(Dataset):
                 else:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
                         self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], ctx_l)  # only one gt
-                    
+
         return dict(meta=meta, model_inputs=model_inputs)
 
     def get_saliency_labels_sub_as_query(self, gt_window, ctx_l, max_n=2):
@@ -140,8 +177,28 @@ class StartEndDataset(Dataset):
         score_array[gt_st:gt_ed+1] = 1
 
         return pos_clip_indices, neg_clip_indices, score_array
-        
+    
 
+    def get_saliency_labels_sub_as_query_(self, gt_window, ctx_l, max_n=2):
+        gt_st = int(gt_window[0] / self.clip_len)
+        gt_ed = max(0, min(int(gt_window[1] / self.clip_len), ctx_l) - 1)
+        if gt_st > gt_ed:
+            gt_st = gt_ed
+
+        if gt_st != gt_ed:
+            pos_clip_indices = random.sample(range(gt_st, gt_ed+1), k=2)
+        else:
+            pos_clip_indices = [gt_st, gt_st]
+
+        neg_pool = list(range(0, gt_st)) + list(range(gt_ed+1, ctx_l))
+        assert len(neg_pool) >= max_n
+        neg_clip_indices = random.sample(neg_pool, k=max_n)
+
+        score_array = np.zeros(ctx_l)
+        score_array[gt_st:gt_ed+1] = 1
+
+        return pos_clip_indices, neg_clip_indices, score_array
+    
     def get_saliency_labels(self, rel_clip_ids, scores, ctx_l, max_n=1, add_easy_negative=True):
         """Sum the scores from the three annotations, then take the two clips with the
         maximum scores as positive, and two with the minimum scores as negative.
@@ -258,7 +315,9 @@ class StartEndDataset(Dataset):
             windows = windows[:self.max_windows]
         if self.span_loss_type == "l1":
             windows = torch.Tensor(windows) / (ctx_l * self.clip_len)  # normalized windows in xx
+            assert windows[0][1] <= (ctx_l *self.clip_len)
             windows = span_xx_to_cxw(windows)  # normalized windows in cxw
+
         elif self.span_loss_type == "ce":
             windows = torch.Tensor([
                 [int(w[0] / self.clip_len), min(int(w[1] / self.clip_len), ctx_l) - 1]
@@ -268,19 +327,20 @@ class StartEndDataset(Dataset):
         return windows
 
     def _get_query_feat_by_qid(self, qid):
-        if self.dset_name == 'tvsum':
-            q_feat = np.load(join(self.q_feat_dir, "{}.npz".format(qid))) # 'token', 'text'
-            return torch.from_numpy(q_feat['token'])
+        if self.dset_name == 'ytc':
+            q_feat_path = join(self.q_feat_dir, f"{qid}.pkl")
+            q_feat = pkl.load(open(q_feat_path, 'rb'))
+            q_feat = q_feat[self.q_feat_type].astype(np.float32)
         else:
             # QVhighlight dataset
             q_feat_path = join(self.q_feat_dir, f"qid{qid}.npz")
             q_feat = np.load(q_feat_path)[self.q_feat_type].astype(np.float32)
-            if self.q_feat_type == "last_hidden_state":
-                q_feat = q_feat[:self.max_q_l]
-            if self.normalize_t:
-                q_feat = l2_normalize_np_array(q_feat)
-            if self.txt_drop_ratio > 0:
-                q_feat = self.random_drop_rows(q_feat)
+        if self.q_feat_type == "last_hidden_state":
+            q_feat = q_feat[:self.max_q_l]
+        if self.normalize_t:
+            q_feat = l2_normalize_np_array(q_feat)
+        if self.txt_drop_ratio > 0:
+            q_feat = self.random_drop_rows(q_feat)
         return torch.from_numpy(q_feat)  # (D, ) or (Lq, D)
 
     def random_drop_rows(self, embeddings):
@@ -296,39 +356,38 @@ class StartEndDataset(Dataset):
         return embeddings
 
     def _get_video_feat_by_vid(self, vid):
-        if self.dset_name == 'tvsum':
+        if self.dset_name == 'ytc':
             v_feat_list = []
             for _feat_dir in self.v_feat_dirs:
-                _feat_path = join(_feat_dir, f"{vid}_rgb.npy")
-                _feat_rgb = np.load(_feat_path)[:self.max_v_l].astype(np.float32)
-
-                _feat_path = join(_feat_dir, f"{vid}_opt.npy")
-                _feat_opt = np.load(_feat_path)[:self.max_v_l].astype(np.float32)
-                
-                _feat = np.concatenate([_feat_rgb, _feat_opt], axis=-1)
-                # _feat = _feat_rgb
-                if self.normalize_v:
+                if "slowfast" in _feat_dir:
+                    _feat_path = join(_feat_dir, f"{vid}_32.npy")
+                    _feat = np.load(_feat_path, allow_pickle=True)
+                    _feat = _feat[:self.max_v_l:self.clip_len].astype(np.float32)
                     _feat = l2_normalize_np_array(_feat)
-                v_feat_list.append(_feat)
-            # some features are slightly longer than the others
-            min_len = min([len(e) for e in v_feat_list])
-            v_feat_list = [e[:min_len] for e in v_feat_list]
-            v_feat = np.concatenate(v_feat_list, axis=1)
+                    v_feat_list.append(_feat)
+
+                else:
+                    _feat_path = join(_feat_dir, f"{vid}.pkl")
+                    _feat = pkl.load(open(_feat_path, 'rb'))
+                    _feat = _feat[:self.max_v_l:self.clip_len].astype(np.float32)
+                    if self.normalize_v:
+                        _feat = l2_normalize_np_array(_feat)
+                    v_feat_list.append(_feat)
 
         else:
             v_feat_list = []
             for _feat_dir in self.v_feat_dirs:
-                _feat_path = join(_feat_dir, f"{vid}.npz")
+                # _feat_path = join(_feat_dir, f"{vid}.npz")
+                _feat_path = _feat_dir+"/"+f"{vid}.npz"
                 _feat = np.load(_feat_path)["features"][:self.max_v_l].astype(np.float32)
                 if self.normalize_v:
                     _feat = l2_normalize_np_array(_feat)
                 v_feat_list.append(_feat)
-            # some features are slightly longer than the others
-            min_len = min([len(e) for e in v_feat_list])
-            v_feat_list = [e[:min_len] for e in v_feat_list]
-            v_feat = np.concatenate(v_feat_list, axis=1)
+        # some features are slightly longer than the others
+        min_len = min([len(e) for e in v_feat_list])
+        v_feat_list = [e[:min_len] for e in v_feat_list]
+        v_feat = np.concatenate(v_feat_list, axis=1)
         return torch.from_numpy(v_feat)  # (Lv, D)
-
 
 
 def start_end_collate(batch):
@@ -373,6 +432,8 @@ def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
 
     if "saliency_all_labels" in batched_model_inputs:
         targets["saliency_all_labels"] = batched_model_inputs["saliency_all_labels"].to(device, non_blocking=non_blocking)
-
+    
+    if "pos_mask" in batched_model_inputs:
+        targets['src_pos_mask']=batched_model_inputs["pos_mask"][0].to(device, non_blocking=non_blocking)
     targets = None if len(targets) == 0 else targets
     return model_inputs, targets

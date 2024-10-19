@@ -90,17 +90,21 @@ def compute_mr_r1(submission, ground_truth, iou_thds=np.linspace(0.5, 0.95, 10))
     pred_windows = np.array([pred_qid2window[k] for k in qids]).astype(float)
     gt_windows = np.array([gt_qid2window[k] for k in qids]).astype(float)
     pred_gt_iou = compute_temporal_iou_batch_paired(pred_windows, gt_windows)
+    miou_at_one = float(f"{np.mean(pred_gt_iou) * 100:.2f}")
     iou_thd2recall_at_one = {}
+    r1s = []
     for thd in iou_thds:
         iou_thd2recall_at_one[str(thd)] = float(f"{np.mean(pred_gt_iou >= thd) * 100:.2f}")
-    return iou_thd2recall_at_one
+        r1s.append(np.mean(pred_gt_iou >= thd))
+    iou_thd2recall_at_one['average'] = float(f"{np.mean(np.array(r1s)) * 100:.2f}")
+    return iou_thd2recall_at_one, miou_at_one
 
 
 def get_window_len(window):
     return window[1] - window[0]
 
 
-def get_data_by_range(submission, ground_truth, len_range):
+def get_data_by_range(submission, ground_truth, opt, len_range):
     """ keep queries with ground truth window length in the specified length range.
     Args:
         submission:
@@ -108,7 +112,7 @@ def get_data_by_range(submission, ground_truth, len_range):
         len_range: [min_l (int), max_l (int)]. the range is (min_l, max_l], i.e., min_l < l <= max_l
     """
     min_l, max_l = len_range
-    if min_l == 0 and max_l == 150:  # min and max l in dataset
+    if min_l == 0 and max_l >= opt.max_v_l * opt.clip_length:  # min and max l in dataset
         return submission, ground_truth
 
     # only keep ground truth with windows in the specified length range
@@ -133,20 +137,36 @@ def get_data_by_range(submission, ground_truth, len_range):
     return submission_in_range, ground_truth_in_range
 
 
-def eval_moment_retrieval(submission, ground_truth, verbose=True):
-    length_ranges = [[0, 10], [10, 30], [30, 150], [0, 150], ]  #
-    range_names = ["short", "middle", "long", "full"]
+def eval_moment_retrieval(submission, ground_truth, opt, verbose=True):
+
+    if opt.dset_name == 'hl':
+        length_ranges = [[0, 10], [10, 30], [30, 150], [0, 150], ]  #
+        range_names = ["short", "middle", "long", "full"]
+    elif 'charades' in opt.dset_name:
+        length_ranges = [[0, 10], [10, 30], [0, 150], ]  #
+        range_names = ["short", "middle", "full"]
+    elif opt.dset_name == 'tacos':
+        length_ranges = [[0, 10], [10, 30], [30, 150], [0, 100000000], ]  #
+        range_names = ["short", "middle", "long", "full"]
+    elif opt.dset_name == 'ytc':
+        length_ranges = [[0, 10000000]]
+        range_names = ["full"]
+    else:
+        assert False
 
     ret_metrics = {}
     for l_range, name in zip(length_ranges, range_names):
         if verbose:
             start_time = time.time()
-        _submission, _ground_truth = get_data_by_range(submission, ground_truth, l_range)
+        _submission, _ground_truth = get_data_by_range(submission, ground_truth, opt, l_range)
         print(f"{name}: {l_range}, {len(_ground_truth)}/{len(ground_truth)}="
               f"{100*len(_ground_truth)/len(ground_truth):.2f} examples.")
         iou_thd2average_precision = compute_mr_ap(_submission, _ground_truth, num_workers=8, chunksize=50)
-        iou_thd2recall_at_one = compute_mr_r1(_submission, _ground_truth)
-        ret_metrics[name] = {"MR-mAP": iou_thd2average_precision, "MR-R1": iou_thd2recall_at_one}
+        iou_thd2recall_at_one, miou_at_one = compute_mr_r1(_submission, _ground_truth)
+        ret_metrics[name] = {"MR-mAP": iou_thd2average_precision, 
+                             "MR-R1": iou_thd2recall_at_one,
+                             "MR-mIoU": miou_at_one,
+                            }
         if verbose:
             print(f"[eval_moment_retrieval] [{name}] {time.time() - start_time:.2f} seconds")
     return ret_metrics
@@ -246,7 +266,7 @@ def eval_highlight(submission, ground_truth, verbose=True):
     return highlight_det_metrics
 
 
-def eval_submission(submission, ground_truth, verbose=True, match_number=True):
+def eval_submission(submission, ground_truth, opt, verbose=True, match_number=True):
     """
     Args:
         submission: list(dict), each dict is {
@@ -289,22 +309,37 @@ def eval_submission(submission, ground_truth, verbose=True, match_number=True):
     eval_metrics_brief = OrderedDict()
     if "pred_relevant_windows" in submission[0]:
         moment_ret_scores = eval_moment_retrieval(
-            submission, ground_truth, verbose=verbose)
+            submission, ground_truth, opt, verbose=verbose)
         eval_metrics.update(moment_ret_scores)
+
         moment_ret_scores_brief = {
             "MR-full-mAP": moment_ret_scores["full"]["MR-mAP"]["average"],
             "MR-full-mAP@0.5": moment_ret_scores["full"]["MR-mAP"]["0.5"],
             "MR-full-mAP@0.75": moment_ret_scores["full"]["MR-mAP"]["0.75"],
-            "MR-short-mAP": moment_ret_scores["short"]["MR-mAP"]["average"],
-            "MR-middle-mAP": moment_ret_scores["middle"]["MR-mAP"]["average"],
-            "MR-long-mAP": moment_ret_scores["long"]["MR-mAP"]["average"],
+            
+            "MR-full-mIoU": moment_ret_scores["full"]["MR-mIoU"],
+
             "MR-full-R1@0.5": moment_ret_scores["full"]["MR-R1"]["0.5"],
             "MR-full-R1@0.7": moment_ret_scores["full"]["MR-R1"]["0.7"],
+            "MR-full-R1": moment_ret_scores["full"]["MR-R1"]["average"],
+
         }
+
+        if 'short' in moment_ret_scores:
+            moment_ret_scores_brief['MR-short-mAP'] = moment_ret_scores["short"]["MR-mAP"]["average"]
+            moment_ret_scores_brief['MR-short-R1'] = moment_ret_scores["short"]["MR-R1"]["average"]
+        if 'middle' in moment_ret_scores:
+            moment_ret_scores_brief['MR-middle-mAP'] = moment_ret_scores["middle"]["MR-mAP"]["average"]
+            moment_ret_scores_brief['MR-middle-R1'] = moment_ret_scores["middle"]["MR-R1"]["average"]
+        if 'long' in moment_ret_scores:
+            moment_ret_scores_brief['MR-long-mAP'] = moment_ret_scores["long"]["MR-mAP"]["average"]
+            moment_ret_scores_brief['MR-long-R1'] = moment_ret_scores["long"]["MR-R1"]["average"]
+
+
         eval_metrics_brief.update(
             sorted([(k, v) for k, v in moment_ret_scores_brief.items()], key=lambda x: x[0]))
 
-    if "pred_saliency_scores" in submission[0]:
+    if "saliency_scores" in ground_truth[0]:
         highlight_det_scores = eval_highlight(
             submission, ground_truth, verbose=verbose)
         eval_metrics.update(highlight_det_scores)
